@@ -1,8 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-import numpy as np, os
+import numpy as np
+import os
+import hashlib
 from dotenv import load_dotenv
+from functools import lru_cache
 from groq import Groq
 
 from utils import (
@@ -10,51 +13,68 @@ from utils import (
     embed_texts, embed_single, build_faiss
 )
 
+# Load API Key
 load_dotenv()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
     raise RuntimeError("Please set GROQ_API_KEY in .env")
 
+# Initialize Groq Client once
 groq_client = Groq(api_key=GROQ_API_KEY)
 
+# Initialize FastAPI
 app = FastAPI(title="HackRx RAG System")
 
-# ---------- API Schemas ----------
+# ---------- Pydantic Schemas ----------
 class HackRxRequest(BaseModel):
-    documents: str                    # single URL for this challenge
+    documents: str  # URL to document
     questions: List[str]
 
 class HackRxResponse(BaseModel):
     answers: List[str]
 
-# ---------- Endpoint -------------
+# ---------- Utility Functions ----------
+def hash_url(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()
+
+@lru_cache(maxsize=10)
+def process_document(url: str):
+    local_path = download_file(url)
+    full_text = extract_text(local_path)
+    chunks = chunk_text(full_text, chunk_size=600, overlap=75)
+    embeddings = embed_texts(chunks)
+    index = build_faiss(embeddings)
+    return chunks, index
+
+# ---------- Main Endpoint ----------
 @app.post("/hackrx/run", response_model=HackRxResponse)
 def run_submission(payload: HackRxRequest):
     try:
-        # 1) Fetch & read the document -------------------
-        local_path = download_file(payload.documents)
-        full_text  = extract_text(local_path)
+        # 1) Process document (cached if repeated)
+        chunks, index = process_document(payload.documents)
 
-        # 2) Split & embed -------------------------------
-        chunks = chunk_text(full_text, chunk_size=600, overlap=75)
-        chunk_emb = embed_texts(chunks)
-        index = build_faiss(chunk_emb)
+        # 2) Batch embed questions
+        question_embeddings = embed_texts(payload.questions)
 
         answers = []
 
-        # 3) Loop over questions -------------------------
-        for q in payload.questions:
-            q_emb = np.array([embed_single(q)], dtype="float32")
+        # 3) Loop through questions and generate answers
+        for i, q in enumerate(payload.questions):
+            q_emb = np.array([question_embeddings[i]], dtype="float32")
             _, idx = index.search(q_emb, k=3)
-            context = "\n---\n".join([chunks[i] for i in idx[0]])
 
+            # Join top relevant chunks
+            context = " ".join([chunks[j] for j in idx[0]])
+
+            # Prepare prompt
             prompt = (
                 "You are an insurance policy assistant. "
-                "Answer ONLY from the context below.\n\n"
+                "Answer ONLY using the context below.\n\n"
                 f"Context:\n{context}\n\n"
                 f"Question: {q}\nAnswer:"
             )
 
+            # Get completion
             resp = groq_client.chat.completions.create(
                 model="llama3-8b-8192",
                 messages=[{"role": "user", "content": prompt}],
